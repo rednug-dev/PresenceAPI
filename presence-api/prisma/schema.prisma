@@ -1,0 +1,29 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model GuildTask {
+  id           String   @id @default(cuid())
+  guildId      String
+  channelId    String
+  messageId    String?
+  title        String
+  notes        String?
+  dueAt        DateTime?
+  priority     Int      @default(2) // 1=Høy, 2=Normal, 3=Lav
+  claimedBy    String?
+  claimedAt    DateTime?
+  done         Boolean  @default(false)
+  completedBy  String?
+  completedAt  DateTime?
+  createdBy    String
+  createdAt    DateTime @default(now())
+
+  @@index([guildId, done, dueAt])
+  @@index([channelId, messageId])
+}
