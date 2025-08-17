@@ -4,9 +4,10 @@
     "type": "commonjs",
     "scripts": {
         "dev": "tsx watch src/index.ts",
-        "start": "prisma migrate deploy && node --loader tsx src/index.ts",
+        "build": "tsc",
+        "start": "prisma migrate deploy && node dist/index.js",
         "register:commands": "tsx scripts/register-commands.ts",
-        "postinstall": "prisma generate"
+        "postinstall": "prisma generate && npm run build"
     },
     "dependencies": {
         "@prisma/client": "^6.14.0",
