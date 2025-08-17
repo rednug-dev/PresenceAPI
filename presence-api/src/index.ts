@@ -11,14 +11,18 @@ import {
   EmbedBuilder,
   TextChannel,
   PermissionFlagsBits,
+  ChatInputCommandInteraction,
+  ButtonInteraction,
+  MessageFlags,
 } from 'discord.js';
 import { PrismaClient } from '@prisma/client';
 
-/* ========== ENV ========== */
+/* ===== ENV ===== */
 const {
   DISCORD_TOKEN,
   GUILD_ID,
   USER_IDS,
+  TODO_CHANNEL_ID, // sett denne i .env
   PORT = '3000',
   PUBLIC_READ = 'false',
   API_KEY,
@@ -30,7 +34,7 @@ if (!DISCORD_TOKEN || !GUILD_ID || !USER_IDS) {
   process.exit(1);
 }
 
-/* ========== Discord client + Prisma ========== */
+/* ===== Clients ===== */
 const prisma = new PrismaClient();
 const client = new Client({
   intents: [
@@ -40,7 +44,7 @@ const client = new Client({
   ],
 });
 
-/* ========== Presence (din eksisterende funksjonalitet) ========== */
+/* ===== Presence API (din) ===== */
 type PresenceView = {
   id: string;
   username: string;
@@ -54,7 +58,6 @@ const cacheMs = Math.max(0, Number(CACHE_SECONDS) * 1000);
 
 async function getTeamPresence(): Promise<PresenceView[]> {
   const guild = await client.guilds.fetch(GUILD_ID);
-  // Hent alle members for å fylle presence-cache
   await guild.members.fetch();
   const ids = USER_IDS.split(',').map((s) => s.trim());
 
@@ -74,7 +77,7 @@ async function getTeamPresence(): Promise<PresenceView[]> {
   });
 }
 
-/* ========== TODO utils ========== */
+/* ===== TODO utils ===== */
 function parseDue(d?: string | null) {
   if (!d) return null;
   const s = d.trim();
@@ -92,9 +95,7 @@ function taskEmbed(t: any) {
     ? `🧑‍💻 Claimet av <@${t.claimedBy}>`
     : '🟢 Åpen';
 
-  const due = t.dueAt
-    ? `<t:${Math.floor(new Date(t.dueAt).getTime() / 1000)}:f>`
-    : '—';
+  const due = t.dueAt ? `<t:${Math.floor(new Date(t.dueAt).getTime() / 1000)}:f>` : '—';
 
   return new EmbedBuilder()
     .setTitle(`${prio(t.priority)} ${t.title}`)
@@ -119,10 +120,48 @@ function taskButtons(t: any) {
   return [row];
 }
 
-async function updateTaskMessage(i: any, t: any) {
+/* — Only in #todo — */
+let allowedChannelId: string | null = TODO_CHANNEL_ID ?? null;
+
+async function ensureTodoChannelReady(): Promise<string | null> {
+  if (allowedChannelId) return allowedChannelId;
+  const guild = await client.guilds.fetch(GUILD_ID);
+  const channels = await guild.channels.fetch();
+  const todo = channels.find(
+    (c: any) => c?.type === ChannelType.GuildText && c?.name?.toLowerCase() === 'todo'
+  ) as TextChannel | undefined;
+  if (todo) {
+    allowedChannelId = todo.id;
+    console.log('[task] TODO_CHANNEL_ID not set, using #todo by name:', allowedChannelId);
+  } else {
+    console.warn('[task] TODO channel not found. Set TODO_CHANNEL_ID in .env');
+  }
+  return allowedChannelId;
+}
+
+const requireInTodoChannel = async (
+  interaction: ChatInputCommandInteraction
+): Promise<boolean> => {
+  const allowed = await ensureTodoChannelReady();
+  if (!allowed) {
+    await interaction.editReply({
+      content: 'Admin: Sett env **TODO_CHANNEL_ID** til #todo-kanalens ID.',
+    });
+    return false;
+  }
+  if (interaction.channelId !== allowed) {
+    await interaction.editReply({ content: `Bruk denne kommandoen i <#${allowed}>.` });
+    return false;
+  }
+  return true;
+};
+
+/* Helpers som ikke avhenger av Interaction-typen */
+async function updateTaskMessage(t: any) {
   try {
-    const ch = await i.client.channels.fetch(t.channelId);
-    if (ch?.type === ChannelType.GuildText && t.messageId) {
+    if (!t.messageId) return;
+    const ch = await client.channels.fetch(t.channelId);
+    if (ch?.type === ChannelType.GuildText) {
       const msg = await (ch as TextChannel).messages.fetch(t.messageId).catch(() => null);
       if (msg) await msg.edit({ embeds: [taskEmbed(t)], components: taskButtons(t) });
     }
@@ -131,10 +170,11 @@ async function updateTaskMessage(i: any, t: any) {
   }
 }
 
-async function deleteTaskMessage(i: any, t: any) {
+async function deleteTaskMessage(t: any) {
   try {
-    const ch = await i.client.channels.fetch(t.channelId);
-    if (ch?.type === ChannelType.GuildText && t.messageId) {
+    if (!t.messageId) return;
+    const ch = await client.channels.fetch(t.channelId);
+    if (ch?.type === ChannelType.GuildText) {
       const msg = await (ch as TextChannel).messages.fetch(t.messageId).catch(() => null);
       if (msg) await msg.delete().catch(() => null);
     }
@@ -143,53 +183,80 @@ async function deleteTaskMessage(i: any, t: any) {
   }
 }
 
-/* ========== Discord handlers ========== */
-client.once('ready', () => {
+/* ===== Discord ===== */
+client.once('ready', async () => {
   console.log(`Discord ready as ${client.user?.tag}`);
+  await ensureTodoChannelReady();
 });
 
 client.on('interactionCreate', async (interaction: Interaction) => {
   try {
     /* ---- Slash: /task ---- */
     if (interaction.isChatInputCommand() && interaction.commandName === 'task') {
-      const sub = interaction.options.getSubcommand();
-      await interaction.deferReply({ ephemeral: true }); // ACK innen 3s
+      const i = interaction as ChatInputCommandInteraction;
+      const sub = i.options.getSubcommand();
+      await i.deferReply({ flags: MessageFlags.Ephemeral }); // ACK innen 3s, uten deprecated warning
 
-      const guildId = interaction.guildId!;
+      if (!(await requireInTodoChannel(i))) return;
+
+      const guildId = i.guildId!;
+      const todoId = allowedChannelId!;
+
       if (sub === 'add') {
-        const title = interaction.options.getString('title', true);
-        const notes = interaction.options.getString('notes') ?? null;
-        const dueStr = interaction.options.getString('due') ?? null;
-        const priority = Math.min(3, Math.max(1, interaction.options.getInteger('priority') ?? 2));
-        const target = interaction.options.getChannel('channel') ?? interaction.channel;
-        if (!target || target.type !== ChannelType.GuildText) {
-          await interaction.editReply({ content: 'Velg en tekstkanal.' });
+        const title = i.options.getString('title', true);
+        const notes = i.options.getString('notes') ?? null;
+        const dueStr = i.options.getString('due') ?? null;
+        const priority = Math.min(3, Math.max(1, i.options.getInteger('priority') ?? 2));
+
+        // rettighets-sjekk i #todo
+        const todoCh = (await client.channels.fetch(todoId)) as TextChannel;
+        const me = await i.guild!.members.fetchMe();
+        const perms = todoCh.permissionsFor(me);
+        if (!perms?.has(['ViewChannel', 'SendMessages', 'EmbedLinks'])) {
+          await i.editReply({
+            content:
+              `Mangler rettigheter i <#${todoId}> (trenger: ViewChannel, SendMessages, EmbedLinks).`,
+          });
           return;
         }
 
+        // DB → post → update (rollback ved feil)
         const created = await prisma.guildTask.create({
           data: {
             guildId,
-            channelId: target.id,
+            channelId: todoId,
             title,
             notes,
             dueAt: parseDue(dueStr),
             priority,
-            createdBy: interaction.user.id,
+            createdBy: i.user.id,
           },
         });
 
-        const embed = taskEmbed(created);
-        const components = taskButtons(created);
-        const msg = await (target as TextChannel).send({ embeds: [embed], components });
-
-        await prisma.guildTask.update({ where: { id: created.id }, data: { messageId: msg.id } });
-        await interaction.editReply({ content: `Oppgave opprettet i <#${target.id}>.` });
+        try {
+          const msg = await todoCh.send({
+            embeds: [taskEmbed(created)],
+            components: taskButtons(created),
+          });
+          await prisma.guildTask.update({
+            where: { id: created.id },
+            data: { messageId: msg.id },
+          });
+          await i.editReply({ content: `Oppgave opprettet i <#${todoId}>.` });
+        } catch (err: any) {
+          await prisma.guildTask.delete({ where: { id: created.id } }); // rollback
+          await i.editReply({
+            content: `Klarte ikke å poste i <#${todoId}>: ${String(err?.message ?? err)}`.slice(
+              0,
+              300
+            ),
+          });
+        }
         return;
       }
 
       if (sub === 'list') {
-        const filter = interaction.options.getString('filter') ?? 'open';
+        const filter = i.options.getString('filter') ?? 'open';
         const where =
           filter === 'claimed'
             ? { guildId, done: false, NOT: { claimedBy: null } }
@@ -221,28 +288,82 @@ client.on('interactionCreate', async (interaction: Interaction) => {
                 const due = t.dueAt
                   ? `— <t:${Math.floor(new Date(t.dueAt).getTime() / 1000)}:R>`
                   : '';
-                return `${who} ${prio(t.priority)} **${t.title}** ${due} ${link}`;
+                const tail = link || `(ID: ${t.id.slice(0, 6)})`;
+                const ghost = t.messageId ? '' : '⚠️ ';
+                return `${ghost}${who} ${prio(t.priority)} **${t.title}** ${due} ${tail}`;
               })
               .join('\n')
           : 'Ingen oppgaver.';
 
-        await interaction.editReply({ content: `**Oppgaver (${filter})**\n${lines}` });
+        await i.editReply({ content: `**Oppgaver (${filter})**\n${lines}` });
+        return;
+      }
+
+      if (sub === 'delete') {
+        const idInput = i.options.getString('id', true).trim();
+        if (idInput.length < 6) {
+          await i.editReply({ content: 'Bruk minst 6 tegn av ID-en (prefix).' });
+          return;
+        }
+
+        const hits = await prisma.guildTask.findMany({
+          where: { guildId, id: { startsWith: idInput } },
+          take: 2,
+        });
+        if (hits.length === 0) {
+          await i.editReply({ content: 'Fant ingen oppgave som matcher den ID-en.' });
+          return;
+        }
+        if (hits.length > 1) {
+          await i.editReply({ content: 'Flere oppgaver matcher prefixet. Oppgi hele ID-en.' });
+          return;
+        }
+
+        const t = hits[0];
+        const member: any = i.member;
+        const canDelete =
+          t.createdBy === i.user.id ||
+          (member?.permissions && member.permissions.has(PermissionFlagsBits.ManageMessages));
+        if (!canDelete) {
+          await i.editReply({ content: 'Du har ikke lov til å slette denne oppgaven.' });
+          return;
+        }
+
+        await prisma.guildTask.delete({ where: { id: t.id } });
+        await deleteTaskMessage(t);
+        await i.editReply({ content: `Slettet: \`${t.id.slice(0, 6)}\`` });
+        return;
+      }
+
+      if (sub === 'cleanup') {
+        const member: any = i.member;
+        if (!(member?.permissions && member.permissions.has(PermissionFlagsBits.ManageMessages))) {
+          await i.editReply({ content: 'Kun moderatorer (Manage Messages) kan kjøre cleanup.' });
+          return;
+        }
+        const ghosts = await prisma.guildTask.findMany({
+          where: { guildId, OR: [{ messageId: null }, { messageId: '' }] },
+          take: 200,
+        });
+        for (const t of ghosts) await prisma.guildTask.delete({ where: { id: t.id } });
+        await i.editReply({ content: `Cleanup: fjernet ${ghosts.length} oppgaver uten melding.` });
         return;
       }
     }
 
-    /* ---- Buttons: Claim / Done / Delete ---- */
+    /* ---- Buttons ---- */
     if (interaction.isButton() && interaction.customId.startsWith('task:')) {
-      await interaction.deferUpdate(); // ACK knappeklikk
-      const [, action, id] = interaction.customId.split(':');
+      const i = interaction as ButtonInteraction;
+      await i.deferUpdate();
 
+      const [, action, id] = i.customId.split(':');
       const task = await prisma.guildTask.findUnique({ where: { id } });
       if (!task) {
-        await interaction.followUp({ content: 'Oppgaven finnes ikke lenger.', ephemeral: true });
+        await i.followUp({ content: 'Oppgaven finnes ikke lenger.', flags: MessageFlags.Ephemeral });
         return;
       }
-      if (task.guildId !== interaction.guildId) {
-        await interaction.followUp({ content: 'Feil server.', ephemeral: true });
+      if (allowedChannelId && task.channelId !== allowedChannelId) {
+        await i.followUp({ content: 'Denne oppgaven er låst til #todo.', flags: MessageFlags.Ephemeral });
         return;
       }
 
@@ -250,89 +371,64 @@ client.on('interactionCreate', async (interaction: Interaction) => {
         const updated = await prisma.guildTask.update({
           where: { id },
           data:
-            task.claimedBy === interaction.user.id
+            task.claimedBy === i.user.id
               ? { claimedBy: null, claimedAt: null }
-              : { claimedBy: interaction.user.id, claimedAt: new Date() },
+              : { claimedBy: i.user.id, claimedAt: new Date() },
         });
-        await updateTaskMessage(interaction, updated);
-        await interaction.followUp({
-          content:
-            task.claimedBy === interaction.user.id
-              ? 'Unclaimed.'
-              : `Claimed av <@${interaction.user.id}>.`,
-          ephemeral: true,
-        });
+        await updateTaskMessage(updated);
         return;
       }
 
       if (action === 'done') {
-        if (task.done) {
-          await interaction.followUp({ content: 'Allerede ferdig.', ephemeral: true });
-          return;
-        }
+        if (task.done) return;
         const updated = await prisma.guildTask.update({
           where: { id },
-          data: { done: true, completedBy: interaction.user.id, completedAt: new Date() },
+          data: { done: true, completedBy: i.user.id, completedAt: new Date() },
         });
-        await updateTaskMessage(interaction, updated);
-        await interaction.followUp({
-          content: `Markert ferdig av <@${interaction.user.id}>.`,
-          ephemeral: true,
-        });
+        await updateTaskMessage(updated);
         return;
       }
 
       if (action === 'del') {
-        const member: any = interaction.member;
+        const member: any = i.member;
         const canDelete =
-          task.createdBy === interaction.user.id ||
+          task.createdBy === i.user.id ||
           (member?.permissions && member.permissions.has(PermissionFlagsBits.ManageMessages));
         if (!canDelete) {
-          await interaction.followUp({
-            content: 'Du har ikke lov til å slette denne oppgaven.',
-            ephemeral: true,
-          });
+          await i.followUp({ content: 'Du har ikke lov til å slette denne oppgaven.', flags: MessageFlags.Ephemeral });
           return;
         }
         await prisma.guildTask.delete({ where: { id } });
-        await deleteTaskMessage(interaction, task);
-        await interaction.followUp({ content: 'Oppgave slettet.', ephemeral: true });
+        await deleteTaskMessage(task);
         return;
       }
     }
   } catch (e) {
     console.error(e);
     if (interaction.isRepliable()) {
-      if (interaction.deferred) {
-        await interaction.editReply({ content: 'Noe gikk galt 🤕' }).catch(() => {});
+      if ('deferred' in interaction && (interaction as any).deferred) {
+        await (interaction as any).editReply({ content: 'Noe gikk galt 🤕' }).catch(() => {});
       } else {
-        await interaction.reply({ content: 'Noe gikk galt 🤕', ephemeral: true }).catch(() => {});
+        await (interaction as any).reply({ content: 'Noe gikk galt 🤕', flags: MessageFlags.Ephemeral }).catch(() => {});
       }
     }
   }
 });
 
-/* ========== Login Discord ========== */
+/* ===== Discord login ===== */
 client.login(DISCORD_TOKEN);
 
-/* ========== Express API (din eksisterende) ========== */
+/* ===== Express API ===== */
 const app = express();
 
-/** PUBLIC: healthz er alltid åpen */
 app.get('/healthz', (_req, res) => {
-  return res.json({
-    ok: true,
-    discordReady: !!client.isReady(),
-    now: new Date().toISOString(),
-  });
+  return res.json({ ok: true, discordReady: !!client.isReady(), now: new Date().toISOString() });
 });
 
-/** API-nøkkel kreves kun for /api/* når PUBLIC_READ !== 'true' */
 app.use('/api', (req, res, next) => {
   if (PUBLIC_READ === 'true') return next();
   const expected = (API_KEY ?? '').trim();
   const got = (req.header('x-api-key') ?? '').trim();
-  console.log('[API KEY CHECK]', { got, expectedLen: expected.length, gotLen: got.length });
   if (!expected || got === expected) return next();
   return res.status(401).json({ error: 'unauthorized' });
 });
@@ -340,10 +436,8 @@ app.use('/api', (req, res, next) => {
 app.get('/api/presence', async (_req, res) => {
   try {
     if (!client.isReady()) return res.status(503).json({ error: 'discord_not_ready' });
-
     const now = Date.now();
     if (cache && now - cache.ts < cacheMs) return res.json(cache.payload);
-
     const team = await getTeamPresence();
     const payload = { updatedAt: new Date().toISOString(), team };
     cache = { payload, ts: now };
