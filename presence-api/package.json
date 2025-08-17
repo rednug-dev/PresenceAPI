@@ -6,7 +6,7 @@
         "dev": "tsx watch src/index.ts",
         "build": "tsc",
         "start": "prisma migrate deploy && node dist/index.js",
-        "register:commands": "tsx scripts/register-commands.ts",
+        "register:commands": "tsx src/scripts/register-commands.ts",
         "postinstall": "prisma generate && npm run build"
     },
     "dependencies": {
